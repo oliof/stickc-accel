@@ -1,5 +1,25 @@
 {
     "files.associations": {
-        "ets_sys.h": "c"
-    }
+        "ets_sys.h": "c",
+        "atomic": "cpp",
+        "*.tcc": "cpp",
+        "chrono": "cpp",
+        "cmath": "cpp",
+        "complex": "cpp",
+        "string": "cpp",
+        "unordered_map": "cpp",
+        "optional": "cpp",
+        "random": "cpp",
+        "fstream": "cpp",
+        "functional": "cpp",
+        "future": "cpp",
+        "istream": "cpp",
+        "limits": "cpp",
+        "sstream": "cpp",
+        "streambuf": "cpp",
+        "tuple": "cpp",
+        "type_traits": "cpp"
+    },
+    "cmake.configureOnOpen": true,
+    "idf.portWin": "COM8"
 }

@@ -5,7 +5,7 @@
 #define I2C_ERR_CHECK(expr, msg) { \
   auto err = (expr); \
   if (err != ESP_OK) { \
-    printf(msg, err); \
+    printf(msg, #msg ": 0x%04x\n"); \
   } \
 }
 esp_err_t i2c_read8(uint8_t addr, uint8_t reg, uint8_t *data);

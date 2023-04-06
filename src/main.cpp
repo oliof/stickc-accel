@@ -13,19 +13,55 @@
 #include "mdns.h"
 #include "i2c-base.hpp"
 #include "fft.h"
+#include "driver/ledc.h"
 
 #define IMU_ADDR 0x68
 #define AXP_ADDR 0x34
 #define BTN_A GPIO_NUM_37
 #define BTN_B GPIO_NUM_39
 #define IMU_INT GPIO_NUM_35
+#define LED_PIN GPIO_NUM_10
+#define LED_CHANNEL LEDC_CHANNEL_7
+#define LED_TIMER LEDC_TIMER_3
+
+#define ACCEL_DATA_SIZE 2048u
+typedef struct {
+    float x[ACCEL_DATA_SIZE];
+    float y[ACCEL_DATA_SIZE];
+    float z[ACCEL_DATA_SIZE];
+    size_t length = 0;
+} accel_data_t;
+
+accel_data_t adata;
 esp_err_t get_handler(httpd_req_t *req) {
     const char resp[] = "/ Response";
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
-void filterAccelData(float *accdata, uint32_t length) {
+void filterAccelData(float *accdata, int n_samples) {
+#define Q_VALUE 10
+#define SAMPLING_FREQ 1000
+    float dt = 1.0f / SAMPLING_FREQ;
+    float fc = (float)(0 + 150) / 2; // center frequency of 80 Hz
+    float alpha = sinf(2.0f * M_PI * fc * dt) / (2.0f * Q_VALUE);
+    float a0 = 1.0f + alpha;
+    float a1 = -2.0f * cosf(2.0f * M_PI * fc * dt) / a0;
+    float a2 = (1.0f - alpha) / a0;
+    float b0 = (1.0f - cosf(2.0f * M_PI * fc * dt)) / (2.0f * a0);
+    float b1 = (1.0f - cosf(2.0f * M_PI * fc * dt)) / a0;
+    float b2 = b0;
+    float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
+
+    for (int i = 0; i < n_samples; i++) {
+        float x0 = accdata[i];
+        float y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        accdata[i] = y0;
+        x2 = x1; x1 = x0;
+        y2 = y1; y1 = y0;
+    }
+}
+void filterAccelData2(float *accdata, uint32_t length) {
     // Define filter coefficients
     float Q = 10.0f;
     #define FILTER_ORDER 2
@@ -62,6 +98,41 @@ void filterAccelData(float *accdata, uint32_t length) {
     }
 }
 
+void processFFT(float *data, uint32_t length, float *hz_out, float *magnitude) {
+    filterAccelData(data, length);
+    // printf("%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n",
+        // data[0], data[90], data[100], data[200], data[300],
+        // data[400], data[500], data[600], data[700], data[800],
+        // data[900], data[1001], data[1102], data[1203], data[1304],
+        // data[1405], data[1506], data[1607], data[1708], data[1809]);
+    heap_caps_check_integrity_all(true);
+    for (uint16_t i = 0; i < length; ++i) {
+        data[i] = data[i] * 10000.0f;
+    }
+    fft_config_t *fft_plan = fft_init(length, FFT_REAL, FFT_FORWARD, data, NULL);
+    heap_caps_check_integrity_all(true);
+    fft_execute(fft_plan);
+    heap_caps_check_integrity_all(true);
+    float max_magnitude = 0;
+    float fundamental_freq = 0;
+    for (int k = 1 ; k < fft_plan->size / 2 ; k++) {
+        float mag = sqrt(pow(fft_plan->output[2*k],2) + pow(fft_plan->output[2*k+1],2));
+
+        float freq = k*1.0f/(ACCEL_DATA_SIZE / 1000.0f);
+        if (mag > max_magnitude) {
+            max_magnitude = mag;
+            fundamental_freq = freq;
+        }
+    }
+    float m = (max_magnitude / 10000) * 2.0f / ACCEL_DATA_SIZE;
+    if (m > *magnitude) {
+        *hz_out = fundamental_freq;
+        *magnitude = m;
+    }
+    printf("fundamental %.03fHz @ %0.03f\n", fundamental_freq, m);
+    fft_destroy(fft_plan);
+}
+
 void dumpImuConfig() {
     uint8_t wm[2];
     uint16_t fifocount;
@@ -77,14 +148,14 @@ void dumpImuConfig() {
     printf("fc=%d\n", ntohs(fifocount));
     printf("wm=%d\n", wm[0] << 8 | wm[1]);
     uint8_t data;
-    I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x38, &data), "failed to read int_en: 0x%04x\n");
+    I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x38, &data), "failed to read int_en");
     printf("int_en=0x%02x\n", data);
     vTaskDelay(1);
-    I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x23, &data), "failed to read fifo_en: 0x%04x\n");
+    I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x23, &data), "failed to read fifo_en");
     printf("fifo_en=0x%02x\n", data);
     vTaskDelay(1);
-    I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x6A, &data), "failed to read user_ctrl: 0x%04x\n");
-    printf("user_ctl=0x%02x\n", &data);
+    I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x6A, &data), "failed to read user_ctrl");
+    printf("user_ctl=0x%02x\n", data);
     vTaskDelay(1);
     uint8_t cfg[4];
     err = i2c_read(IMU_ADDR, 0x1A, cfg, 4);
@@ -116,14 +187,79 @@ static const char *TAG = "wifi station";
 
 static int s_retry_num = 0;
 
+StaticSemaphore_t data_proc_buffer;
+SemaphoreHandle_t data_proc;
+
 StaticSemaphore_t screen_toggle_buffer;
+SemaphoreHandle_t screen_toggle;
+
 StaticSemaphore_t imu_fifo_sync_buffer;
 SemaphoreHandle_t fifo_sync;
-SemaphoreHandle_t screen_toggle;
 
 // M5Unified uses their own i2c driver that conflicts with native i2c
 StaticSemaphore_t i2c_exclusive_buffer;
 SemaphoreHandle_t i2c_exclusive;
+
+float xhz, yhz, zhz, xmag = 0, ymag = 0, zmag = 0;
+float xdata[ACCEL_DATA_SIZE];
+float ydata[ACCEL_DATA_SIZE];
+float zdata[ACCEL_DATA_SIZE];
+void dataProcessingTask(void *pvArgs) {
+    TickType_t xFrequency = pdMS_TO_TICKS(500);
+    for (;;) {
+        bool has_data = false;
+        if (!xSemaphoreTake(data_proc, xFrequency)) {
+            continue;
+        }
+        if (adata.length == ACCEL_DATA_SIZE) {
+            adata.length = 0;
+            has_data = true;
+            memcpy(xdata, adata.x, ACCEL_DATA_SIZE * sizeof(float));
+            memcpy(ydata, adata.y, ACCEL_DATA_SIZE * sizeof(float));
+            memcpy(zdata, adata.z, ACCEL_DATA_SIZE * sizeof(float));
+        }
+        xSemaphoreGive(data_proc);
+        if (has_data) {
+            processFFT(xdata, ACCEL_DATA_SIZE, &xhz, &xmag);
+            esp_task_wdt_reset();
+            processFFT(ydata, ACCEL_DATA_SIZE, &yhz, &ymag);
+            esp_task_wdt_reset();
+            processFFT(zdata, ACCEL_DATA_SIZE, &zhz, &zmag);
+            esp_task_wdt_reset();
+        }
+    }
+}
+
+void collateData(uint16_t *data, uint32_t length) {
+    if (length % 4) {
+        printf("Length isn't a multiple of 4?? %d\n", length);
+    }
+    uint32_t remaining = length;
+    static constexpr float aRes = 8.0f / 32768.0f;
+    if (!xSemaphoreTake(data_proc, pdMS_TO_TICKS(1000))) {
+        printf("Failed to get data proc semaphore\n");
+        return;
+    }
+    uint16_t i, j;
+    for (i = 0, j = adata.length; (i * 4) < length; ++i, ++j) {
+        if (j == ACCEL_DATA_SIZE) {
+            j = 0;
+            xSemaphoreGive(data_proc);
+            while (adata.length != 0) {
+                taskYIELD();
+            }
+            if (!xSemaphoreTake(data_proc, pdMS_TO_TICKS(1000))) {
+                printf("Failed to get data proc semaphore to continue\n");
+            }
+        }
+        adata.x[j] = (int16_t)(ntohs(data[i * 4    ])) * aRes;
+        adata.y[j] = (int16_t)(ntohs(data[i * 4 + 1])) * aRes;
+        adata.z[j] = (int16_t)(ntohs(data[i * 4 + 2])) * aRes;
+        remaining -= 4;
+        adata.length = j + 1;
+    }
+    xSemaphoreGive(data_proc);
+}
 
 void add_mdns_services()
 {
@@ -269,15 +405,33 @@ uint8_t getBatteryLevel() {
     return (res < 100) ? res : 100;
 }
 bool imuInitialized = false;
+bool shutdown = false;
 float ax, ay, az;
 uint8_t watermarkStatus;
 uint8_t intStatus;
 bool screenOn = true;
+const char *spinners[] = {
+    ">            ",
+    ">>           ",
+    " >>          ",
+    "  >>         ",
+    "   >>        ",
+    "    >>       ",
+    "     >>      ",
+    "      >>     ",
+    "       >>    ",
+    "        >>   ",
+    "         >>  ",
+    "          >> ",
+    "           >>",
+    "            >",
+};
+#define SPINNERS_LENGTH 14
 void screenTask(void *pvParams) {
+    static uint8_t spinner_pos = 0;
     printf("Screen entry\n");
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    TickType_t xFrequency = pdMS_TO_TICKS(1000 / 30);
-    M5.Displays(0).setTextSize(1);
+    TickType_t xFrequency = pdMS_TO_TICKS(1000 / 12);
     M5Canvas canvas;
     auto depth = M5.Displays(0).getColorDepth();
     canvas.setColorDepth(depth);
@@ -285,28 +439,35 @@ void screenTask(void *pvParams) {
     int32_t height = M5.Displays(0).height();
     canvas.createSprite(width, height);
     auto palette = canvas.getPalette();
-    // M5.Displays(0).sleep();
-    // M5.Displays(0).setBrightness(0);
     for (;;) {
-        static int on = 0;
-        on = !on;
-
+        if (shutdown) {
+            vTaskDelete(NULL);
+            return;
+        }
         if (screenOn) {
-            canvas.setCursor(0, 0);
+            canvas.setCursor(0, 10);
             canvas.fillRect(0, 0, 80, 80);
-            canvas.printf("No.%d\n", on);
+            canvas.setTextSize(1.25);
             if (imuInitialized) {
-                canvas.printf("x = %f\n", ax);
-                canvas.printf("y = %f\n", ay);
-                canvas.printf("z = %f\n", az);
-                canvas.printf("wm = 0x%02x\nint = 0x%02x\n", watermarkStatus, intStatus);
+                canvas.printf(" x = %.1fHz\n", xhz);
+                canvas.printf("     %.3f\n\n", xmag);
+                canvas.printf(" y = %.1fHz\n", yhz);
+                canvas.printf("     %.3f\n\n", ymag);
+                canvas.printf(" z = %.1fHz\n", zhz);
+                canvas.printf("     %.3f\n\n", zmag);
             } else {
                 canvas.printf("No IMU\n");
             }
             canvas.fillRect(30, 140, 50, 20);
-            canvas.setCursor(30, 140);
+            canvas.setCursor(0, 140);
+            canvas.setTextSize(1);
             // canvas.printf("%3d%%\n", M5.Power.getBatteryLevel());
-            canvas.printf("%3d%%\n", getBatteryLevel());
+            canvas.printf(" batt =  %3d%%\n", getBatteryLevel());
+            canvas.setCursor(0, 150);
+            canvas.printf(spinners[++spinner_pos % SPINNERS_LENGTH]);
+            if (spinner_pos % SPINNERS_LENGTH == 0) {
+                spinner_pos = 0;
+            }
             M5.Displays(0).pushImageDMA(0, 0, width, height, canvas.getBuffer(), depth, palette);
         }
 
@@ -319,25 +480,27 @@ bool pwrButtonClicked() {
 
     while (!xSemaphoreTake(i2c_exclusive, pdMS_TO_TICKS(1000)));
     uint8_t val;
-    I2C_ERR_CHECK(i2c_read8(AXP_ADDR, 0x46, &val), "failed to read pwr button: 0x%04x\n");
+    I2C_ERR_CHECK(i2c_read8(AXP_ADDR, 0x46, &val), "failed to read pwr button");
     xSemaphoreGive(i2c_exclusive);
     if (val & 0x03) { i2c_write8(AXP_ADDR, 0x46, val); }
     return val == 2;
 }
 
-void loopTask(void *pvParams) {
-    printf("Loop entry\n");
-
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    TickType_t xFrequency = pdMS_TO_TICKS(100);
-    for (;;) {
-        if (pwrButtonClicked()) {
-            ESP_LOGI(TAG, "Restart");
-            esp_restart();
-        }
-        taskYIELD();
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+void power_led(uint8_t brightness) {
+    uint8_t brightness2 = ~brightness;
+#if SOC_LEDC_SUPPORT_HS_MODE
+    // this stuff doesn't work at all...
+    ledc_set_duty_with_hpoint(LEDC_HIGH_SPEED_MODE, LED_CHANNEL, brightness2, 0x1ff);
+    ledc_update_duty(LEDC_HIGH_SPEED_MODE, LED_CHANNEL);
+    if (!brightness) {
+        ledc_stop(LEDC_HIGH_SPEED_MODE, LED_CHANNEL, brightness2);
     }
+    // ledc_set_duty_and_update(LEDC_HIGH_SPEED_MODE, LED_CHANNEL, brightness,
+            // ledc_get_hpoint(LEDC_HIGH_SPEED_MODE, LED_CHANNEL));
+#else
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)_cfg.pwm_channel, duty);
+      ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)_cfg.pwm_channel);
+#endif
 }
 
 bool need_fifo_sync = false;
@@ -357,7 +520,7 @@ void imuInit() {
     }
 
     uint8_t imuWhoami;
-    I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x75, &imuWhoami), "failed to read imu whoami: 0x%04x\n");
+    I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x75, &imuWhoami), "failed to read imu whoami");
     if (imuWhoami != 25) {
         printf("MPU6886 not detected\n");
         return;
@@ -420,8 +583,13 @@ void imuSyncTask(void *pvParams) {
     TickType_t xFrequency = pdMS_TO_TICKS(1000);
     static constexpr float aRes = 8.0f / 32768.0f;
     for (;;) {
+        if (shutdown) {
+            vTaskDelete(NULL);
+            return;
+        }
         if (!xSemaphoreTake(i2c_exclusive, xFrequency)) {
             printf("i2c exclusive timed out???\n");
+            continue;
         }
         if (need_fifo_sync || xSemaphoreTake(fifo_sync, xFrequency)) {
             if (!imuInitialized) {
@@ -431,9 +599,9 @@ void imuSyncTask(void *pvParams) {
                 goto give;
             }
             // read, should have 0x40
-            I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x39, &watermarkStatus), "failed to read watermark status: 0x%04x\n");
+            I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x39, &watermarkStatus), "failed to read watermark status");
             // read 0x10 if fifo overflow
-            I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x3A, &intStatus), "failed to read int status: 0x%04x\n");
+            I2C_ERR_CHECK(i2c_read8(IMU_ADDR, 0x3A, &intStatus), "failed to read int status");
             if ((intStatus & 0x01) != 0) {
                 static uint8_t adata[6];
                 auto err = i2c_read(IMU_ADDR, 0x3B, adata, 6);
@@ -482,15 +650,16 @@ void imuSyncTask(void *pvParams) {
                     printf("remaining after errors=%d\n", fifocount);
                 }
 
-                printf("cnt=%d, x=%f, y=%f, z=%f, t=%f\n", fifocount,
-                    (int16_t)ntohs(fifodata[4]) * aRes,
-                    (int16_t)ntohs(fifodata[5]) * aRes,
-                    (int16_t)ntohs(fifodata[6]) * aRes,
-                    25.0f + ntohs(fifodata[3]) / 326.8f);
+                // printf("cnt=%d, x=%f, y=%f, z=%f, t=%f\n", fifocount,
+                    // (int16_t)ntohs(fifodata[4]) * aRes,
+                    // (int16_t)ntohs(fifodata[5]) * aRes,
+                    // (int16_t)ntohs(fifodata[6]) * aRes,
+                    // 25.0f + ntohs(fifodata[3]) / 326.8f);
 
                 ax = (int16_t)ntohs(fifodata[4]) * aRes;
                 ay = (int16_t)ntohs(fifodata[5]) * aRes;
                 az = (int16_t)ntohs(fifodata[6]) * aRes;
+                collateData(fifodata, fifocount/2);
             } else if (fifocount > 1024) {
                 imuInitialized = false;
                 imuInit();
@@ -533,8 +702,11 @@ void imuSyncTask(void *pvParams) {
                 imuInit();
             }
         }
+        // power_led(0);
+        gpio_set_level(LED_PIN, 1);
         give:
         xSemaphoreGive(i2c_exclusive);
+        taskYIELD();
     }
 }
 
@@ -605,6 +777,12 @@ void screenToggleIsr(void *args) {
     xSemaphoreGive(screen_toggle);
 }
 
+void resetHoldIsr(void *args) {
+    xmag = 0;
+    ymag = 0;
+    zmag = 0;
+}
+
 void gpio_init() {
     ESP_ERROR_CHECK(gpio_wakeup_disable(IMU_INT));
     ESP_ERROR_CHECK(gpio_set_direction(IMU_INT, GPIO_MODE_INPUT));
@@ -616,21 +794,90 @@ void gpio_init() {
     ESP_ERROR_CHECK(gpio_isr_handler_add(BTN_A, screenToggleIsr, NULL));
     ESP_ERROR_CHECK(gpio_set_intr_type(BTN_A, GPIO_INTR_NEGEDGE));
     ESP_ERROR_CHECK(gpio_pullup_en(BTN_A));
+
+    ESP_ERROR_CHECK(gpio_isr_handler_add(BTN_B, resetHoldIsr, NULL));
+    ESP_ERROR_CHECK(gpio_set_intr_type(BTN_B, GPIO_INTR_NEGEDGE));
+    ESP_ERROR_CHECK(gpio_pullup_en(BTN_B));
 }
 
 void shutdown_handler() {
+    shutdown = true;
+    gpio_set_level(LED_PIN, 0);
     M5.Displays(0).releaseBus();
     gpio_uninstall_isr_service();
+    dumpImuConfig();
+    i2c_write8(IMU_ADDR, 0x6A, 0x00); // turn off fifo mode
+    i2c_write8(IMU_ADDR, 0x38, 0x00);  // INT_ENABLE(0x38)
+    i2c_write8(IMU_ADDR, 0x23, 0x00);  // FIFO_EN(0x23)
+    dumpImuConfig();
     i2c_driver_delete(I2C_NUM_0);
+}
+
+void loopTask(void *pvParams) {
+    printf("Loop entry\n");
+
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    TickType_t xFrequency = pdMS_TO_TICKS(1000);
+    uint8_t count = 0;
+    for (;;) {
+        if (pwrButtonClicked()) {
+            ESP_LOGI(TAG, "Restart");
+            while (!xSemaphoreTake(i2c_exclusive, pdMS_TO_TICKS(1000)));
+            shutdown_handler();
+            esp_restart();
+        }
+        if (++count % 5 == 0) {
+            gpio_set_level(LED_PIN, 0);
+            count = 0;
+        }
+        taskYIELD();
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+
+void power_led_init() {
+    static ledc_channel_config_t ledc_channel;
+    {
+     ledc_channel.gpio_num   = LED_PIN;
+#if SOC_LEDC_SUPPORT_HS_MODE
+     ledc_channel.speed_mode = LEDC_HIGH_SPEED_MODE;
+#else
+     ledc_channel.speed_mode = LEDC_LOW_SPEED_MODE;
+#endif
+     ledc_channel.channel    = LED_CHANNEL;
+     ledc_channel.intr_type  = LEDC_INTR_DISABLE;
+     ledc_channel.timer_sel  = LED_TIMER;
+     ledc_channel.duty       = ~0x10; // stickc is inverted
+     ledc_channel.hpoint     = 0x1fff;
+    };
+    static ledc_timer_config_t ledc_timer;
+    {
+#if SOC_LEDC_SUPPORT_HS_MODE
+      ledc_timer.speed_mode = LEDC_HIGH_SPEED_MODE;     // timer mode
+#else
+      ledc_timer.speed_mode = LEDC_LOW_SPEED_MODE;
+#endif
+      ledc_timer.duty_resolution = LEDC_TIMER_8_BIT; // resolution of PWM duty
+      ledc_timer.freq_hz = 1200;                        // frequency of PWM signal
+      ledc_timer.timer_num = ledc_channel.timer_sel;    // timer index
+    };
+    ledc_channel_config(&ledc_channel);
+    ledc_timer_config(&ledc_timer);
 }
 
 TaskHandle_t tLoop;
 TaskHandle_t tScreen;
 TaskHandle_t tImu;
 TaskHandle_t tImuSync;
+TaskHandle_t tDataProcessing;
 TaskHandle_t tScreenToggle;
 extern "C" {
 void app_main() {
+    gpio_pad_select_gpio(LED_PIN);
+    ESP_ERROR_CHECK(gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT));
+    ESP_ERROR_CHECK(gpio_set_level(LED_PIN, 0));
+    // power_led_init();
+    // power_led(50);
     //Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -642,7 +889,7 @@ void app_main() {
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
 
-    esp_register_shutdown_handler(shutdown_handler);
+    // esp_register_shutdown_handler(shutdown_handler);
 
     auto cfg = M5.config();
     cfg.internal_imu = false;
@@ -653,20 +900,23 @@ void app_main() {
 
     i2c_init();
     uint8_t axp03;
-    I2C_ERR_CHECK(i2c_read8(0x34, 0x03, &axp03), "failed to read axp 0x03: 0x%04x\n");
+    I2C_ERR_CHECK(i2c_read8(0x34, 0x03, &axp03), "failed to read axp 0x03");
     printf("\naxp03 == 0x03: %d\n", axp03 == 0x03);
 
+    data_proc = xSemaphoreCreateMutexStatic(&data_proc_buffer);
     fifo_sync = xSemaphoreCreateBinaryStatic(&imu_fifo_sync_buffer);
     screen_toggle = xSemaphoreCreateBinaryStatic(&screen_toggle_buffer);
     i2c_exclusive = xSemaphoreCreateMutexStatic(&i2c_exclusive_buffer);
     xSemaphoreGive(i2c_exclusive);
+    xSemaphoreGive(data_proc);
     gpio_init();
 
-    xTaskCreatePinnedToCore(loopTask, "loop", 2*2048, NULL, 2, &tLoop, APP_CPU_NUM);
-    xTaskCreatePinnedToCore(screenTask, "screen", 8 * 2048, NULL, 2, &tScreen, APP_CPU_NUM);
-    xTaskCreatePinnedToCore(imuTask, "imu", 4 * 2048, NULL, 2, &tImu, APP_CPU_NUM);
-    xTaskCreatePinnedToCore(imuSyncTask, "imusync", 4 * 2048, NULL, 2, &tImuSync, APP_CPU_NUM);
-    xTaskCreatePinnedToCore(screenToggle, "screentoggle", 2048, NULL, 2, &tScreenToggle, APP_CPU_NUM);
+    xTaskCreatePinnedToCore(loopTask, "loop", 2*2048, NULL, 2, &tLoop, PRO_CPU_NUM);
+    xTaskCreatePinnedToCore(screenTask, "screen", 8 * 2048, NULL, 2, &tScreen, PRO_CPU_NUM);
+    xTaskCreatePinnedToCore(imuTask, "imu", 1 * 2048, NULL, 2, &tImu, PRO_CPU_NUM);
+    xTaskCreatePinnedToCore(imuSyncTask, "imusync", 4 * 2048, NULL, 2, &tImuSync, PRO_CPU_NUM);
+    xTaskCreatePinnedToCore(dataProcessingTask, "dataproc", 4 * 2048, NULL, 2, &tDataProcessing, APP_CPU_NUM);
+    xTaskCreatePinnedToCore(screenToggle, "screentoggle", 2048, NULL, 2, &tScreenToggle, PRO_CPU_NUM);
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
