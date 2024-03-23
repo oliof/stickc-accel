@@ -100,19 +100,16 @@ void filterAccelData2(float *accdata, uint32_t length) {
 
 void processFFT(float *data, uint32_t length, float *hz_out, float *magnitude) {
     filterAccelData(data, length);
-    // printf("%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n",
-        // data[0], data[90], data[100], data[200], data[300],
-        // data[400], data[500], data[600], data[700], data[800],
-        // data[900], data[1001], data[1102], data[1203], data[1304],
-        // data[1405], data[1506], data[1607], data[1708], data[1809]);
-    heap_caps_check_integrity_all(true);
+    printf("%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n",
+        data[0], data[1], data[2], data[3], data[4],
+        data[5], data[6], data[7], data[8], data[9],
+        data[900], data[1001], data[1102], data[1203], data[1304],
+        data[1405], data[1406], data[1407], data[1408], data[1409]);
     for (uint16_t i = 0; i < length; ++i) {
         data[i] = data[i] * 10000.0f;
     }
     fft_config_t *fft_plan = fft_init(length, FFT_REAL, FFT_FORWARD, data, NULL);
-    heap_caps_check_integrity_all(true);
     fft_execute(fft_plan);
-    heap_caps_check_integrity_all(true);
     float max_magnitude = 0;
     float fundamental_freq = 0;
     for (int k = 1 ; k < fft_plan->size / 2 ; k++) {
@@ -212,11 +209,11 @@ void dataProcessingTask(void *pvArgs) {
             continue;
         }
         if (adata.length == ACCEL_DATA_SIZE) {
-            adata.length = 0;
             has_data = true;
             memcpy(xdata, adata.x, ACCEL_DATA_SIZE * sizeof(float));
             memcpy(ydata, adata.y, ACCEL_DATA_SIZE * sizeof(float));
             memcpy(zdata, adata.z, ACCEL_DATA_SIZE * sizeof(float));
+            adata.length = 0;
         }
         xSemaphoreGive(data_proc);
         if (has_data) {
@@ -234,7 +231,6 @@ void collateData(uint16_t *data, uint32_t length) {
     if (length % 4) {
         printf("Length isn't a multiple of 4?? %d\n", length);
     }
-    uint32_t remaining = length;
     static constexpr float aRes = 8.0f / 32768.0f;
     if (!xSemaphoreTake(data_proc, pdMS_TO_TICKS(1000))) {
         printf("Failed to get data proc semaphore\n");
@@ -255,7 +251,6 @@ void collateData(uint16_t *data, uint32_t length) {
         adata.x[j] = (int16_t)(ntohs(data[i * 4    ])) * aRes;
         adata.y[j] = (int16_t)(ntohs(data[i * 4 + 1])) * aRes;
         adata.z[j] = (int16_t)(ntohs(data[i * 4 + 2])) * aRes;
-        remaining -= 4;
         adata.length = j + 1;
     }
     xSemaphoreGive(data_proc);
@@ -406,7 +401,6 @@ uint8_t getBatteryLevel() {
 }
 bool imuInitialized = false;
 bool shutdown = false;
-float ax, ay, az;
 uint8_t watermarkStatus;
 uint8_t intStatus;
 bool screenOn = true;
@@ -581,7 +575,6 @@ void imuInit() {
 void imuSyncTask(void *pvParams) {
     printf("Sync entry\n");
     TickType_t xFrequency = pdMS_TO_TICKS(1000);
-    static constexpr float aRes = 8.0f / 32768.0f;
     for (;;) {
         if (shutdown) {
             vTaskDelete(NULL);
@@ -608,15 +601,14 @@ void imuSyncTask(void *pvParams) {
                 if (err != ESP_OK) {
                     printf("err reading accel 0x%04x\n", err);
                 }
-                ax = (std::int16_t)((adata[0] << 8) + adata[1]) * aRes;
-                ay = (std::int16_t)((adata[2] << 8) + adata[3]) * aRes;
-                az = (std::int16_t)((adata[4] << 8) + adata[5]) * aRes;
+                printf("Did not expect data ready INT, not requested\n");
                 goto give;
             }
             if ((intStatus & 0x10) != 0) {
                 printf("FIFO overflow!\n");
             }
             if ((watermarkStatus & 0x40) == 0) {
+                printf("INT not watermark\n");
                 goto give;
             }
             // printf("Interrupt: wm=0x%02x int=0x%02x\n", watermarkStatus, intStatus);
@@ -629,7 +621,7 @@ void imuSyncTask(void *pvParams) {
             if (fifocount && fifocount < 1025) {
                 uint16_t fiforem = fifocount;
                 uint16_t offset = 0;
-                uint16_t readsize = 210;
+                uint16_t readsize = fifocount;
                 bool haserrors = false;
                 while (fiforem > 0) {
                     uint16_t toread = std::min(readsize, fiforem);
@@ -651,14 +643,11 @@ void imuSyncTask(void *pvParams) {
                 }
 
                 // printf("cnt=%d, x=%f, y=%f, z=%f, t=%f\n", fifocount,
-                    // (int16_t)ntohs(fifodata[4]) * aRes,
-                    // (int16_t)ntohs(fifodata[5]) * aRes,
-                    // (int16_t)ntohs(fifodata[6]) * aRes,
+                    // (int16_t)ntohs(fifodata[376]) * aRes,
+                    // (int16_t)ntohs(fifodata[377]) * aRes,
+                    // (int16_t)ntohs(fifodata[378]) * aRes,
                     // 25.0f + ntohs(fifodata[3]) / 326.8f);
 
-                ax = (int16_t)ntohs(fifodata[4]) * aRes;
-                ay = (int16_t)ntohs(fifodata[5]) * aRes;
-                az = (int16_t)ntohs(fifodata[6]) * aRes;
                 collateData(fifodata, fifocount/2);
             } else if (fifocount > 1024) {
                 imuInitialized = false;
@@ -755,7 +744,9 @@ void screenToggle(void *pvArgs) {
     static uint8_t brightness;
     for (;;) {
         if (xSemaphoreTake(screen_toggle, pdMS_TO_TICKS(5000))) {
-            while (!xSemaphoreTake(i2c_exclusive, pdMS_TO_TICKS(1000)));
+
+            while (!xSemaphoreTake(i2c_exclusive, pdMS_TO_TICKS(1000)))
+                ; //noop
             screenOn = !screenOn;
             if (!savedBrightness) {
                 savedBrightness = true;
